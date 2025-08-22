@@ -1,3 +1,4 @@
+// Updated chat/chat.go - Modified PeerHandler function
 package chat
 
 import (
@@ -8,25 +9,32 @@ import (
 	"strings"
 	"sync"
     "github.com/google/uuid"
+    "gochat/internal/tui"
 )
 
 type Peer struct {
-    uuid string // Unique identifier for the Peer
-    Name string        // Name of the Peer
-    Conn net.Conn    // Connection to the Peer
-    mu sync.Mutex // Mutex to protect concurrent access to the connection
+    uuid string
+    Name string
+    Conn net.Conn
+    mu sync.Mutex
 }
 
-
 type ChatRoom struct {
-    Peers []Peer    // List of connected peers
-    mu sync.Mutex // Mutex to protect concurrent access to the chat room
+    Peers []Peer
+    mu sync.Mutex
+    // Add channel for sending messages to TUI
+    tuiMsgChan chan<- tui.Message
 }
 
 func NewRoom() *ChatRoom {
     return &ChatRoom{
         Peers: make([]Peer, 0),
     }
+}
+
+// New function to set the TUI message channel
+func (cr *ChatRoom) SetTUIMessageChannel(ch chan<- tui.Message) {
+    cr.tuiMsgChan = ch
 }
 
 func (cr *ChatRoom) AddPeer(name string, conn net.Conn) {
@@ -39,12 +47,11 @@ func (cr *ChatRoom) AddPeer(name string, conn net.Conn) {
         Conn: conn,
     }
     cr.Peers = append(cr.Peers, peer)
-    fmt.Println(util.Info, "Added peer:", name, "with UUID:", peer.uuid)
 }
 
+// Modified PeerHandler to send messages through channel instead of directly to TUI
 func PeerHandler(ctx context.Context, conn net.Conn, name string, room *ChatRoom) {
     defer conn.Close()
-    fmt.Println(util.Info, "Handling connection from", conn.RemoteAddr())
 
     // Send and receive name for initial handshake
     if err := SendMsg(conn, name); err != nil {
@@ -55,7 +62,6 @@ func PeerHandler(ctx context.Context, conn net.Conn, name string, room *ChatRoom
     receivedName, err := ReceiveMsg(conn)
     if err != nil {
         if err.Error() == "EOF" {
-            fmt.Println(util.Info, "Peer closed connection during handshake")
         } else {
             fmt.Println(util.Error, "Failed to receive name:", err)
         }
@@ -65,7 +71,14 @@ func PeerHandler(ctx context.Context, conn net.Conn, name string, room *ChatRoom
     // Add peer to chat room
     room.AddPeer(receivedName, conn)
 
-    fmt.Println(util.Info, "Peer", receivedName, "added to chat room")
+    // Send join notification to TUI through channel
+    if room.tuiMsgChan != nil {
+        select {
+        case room.tuiMsgChan <- tui.Message{From: "System", Text: fmt.Sprintf("%s joined the chat", receivedName)}:
+        default:
+            fmt.Println(util.Warning, "TUI message channel full, dropping join notification")
+        }
+    }
 
     // Handle incoming messages with proper context handling
     messageChan := make(chan string, 1)
@@ -80,7 +93,6 @@ func PeerHandler(ctx context.Context, conn net.Conn, name string, room *ChatRoom
             msg, err := ReceiveMsg(conn)
             if err != nil {
                 if err.Error() == "EOF" {
-                    // Connection closed by peer
                     errorChan <- fmt.Errorf("connection closed by peer")
                 } else {
                     errorChan <- err
@@ -95,31 +107,65 @@ func PeerHandler(ctx context.Context, conn net.Conn, name string, room *ChatRoom
     for {
         select {
         case <-ctx.Done():
-            fmt.Println(util.Info, "PeerHandler shutting down for", conn.RemoteAddr())
-            p := room.FindPeerByConn(conn)
-            if p != nil {
-                room.RemovePeer(p.uuid)
+            pe := room.FindPeerByConn(conn)
+            if pe != nil {
+                room.RemovePeer(pe.uuid)
+                // Send leave notification to TUI through channel
+                if room.tuiMsgChan != nil {
+                    select {
+                    case room.tuiMsgChan <- tui.Message{From: "System", Text: fmt.Sprintf("%s left the chat", receivedName)}:
+                    default:
+                        fmt.Println(util.Warning, "TUI message channel full, dropping leave notification")
+                    }
+                }
             }
             return
         case msg := <-messageChan:
             if msg == "" {
                 continue
             }
-            // Remove any trailing newlines and add exactly one
+            // Clean the message
             msg = strings.TrimSpace(msg)
             if msg != "" {
-                fmt.Println(msg)
+                // Parse the message to extract sender and content
+                // Messages are formatted as "Sender: content"
+                parts := strings.SplitN(msg, ":", 2)
+                var sender, content string
+                if len(parts) == 2 {
+                    sender = strings.TrimSpace(parts[0])
+                    content = strings.TrimSpace(parts[1])
+                } else {
+                    // Fallback if message doesn't have expected format
+                    sender = receivedName
+                    content = msg
+                }
+                
+                // Send message to TUI through channel
+                if room.tuiMsgChan != nil {
+                    select {
+                    case room.tuiMsgChan <- tui.Message{From: sender, Text: content}:
+                    default:
+                        fmt.Println(util.Warning, "TUI message channel full, dropping message from", sender)
+                    }
+                }
             }
         case err := <-errorChan:
             if err != nil {
                 if err.Error() == "connection closed by peer" {
-                    fmt.Println(util.Info, "Peer closed connection:", conn.RemoteAddr())
                 } else {
                     fmt.Println(util.Error, "Connection error:", err)
                 }
-                p := room.FindPeerByConn(conn)
-                if p != nil {
-                    room.RemovePeer(p.uuid)
+                peer := room.FindPeerByConn(conn)
+                if peer != nil {
+                    room.RemovePeer(peer.uuid)
+                    // Send leave notification to TUI through channel
+                    if room.tuiMsgChan != nil {
+                        select {
+                        case room.tuiMsgChan <- tui.Message{From: "System", Text: fmt.Sprintf("%s left the chat", receivedName)}:
+                        default:
+                            fmt.Println(util.Warning, "TUI message channel full, dropping leave notification")
+                        }
+                    }
                 }
                 return
             }
@@ -128,7 +174,6 @@ func PeerHandler(ctx context.Context, conn net.Conn, name string, room *ChatRoom
 }
 
 func SendMsg(conn net.Conn, msg string) error {
-    // Remove any existing newlines and add exactly one
     msg = strings.TrimSpace(msg) + "\n"
     _, err := conn.Write([]byte(msg))
     if err != nil {
@@ -137,6 +182,7 @@ func SendMsg(conn net.Conn, msg string) error {
     }
     return nil
 }
+
 func ReceiveMsg(conn net.Conn) (string, error) {
     buffer := make([]byte, 1024)
     n, err := conn.Read(buffer)
@@ -153,8 +199,7 @@ func ReceiveMsg(conn net.Conn) (string, error) {
     return msg, nil
 }
 
-
-func Broadcast(room *ChatRoom, msg string){
+func Broadcast(room *ChatRoom, msg string) {
     room.mu.Lock()
     defer room.mu.Unlock()
 
@@ -165,13 +210,12 @@ func Broadcast(room *ChatRoom, msg string){
     }
 }
 
-func (room *ChatRoom) RemovePeer( uuid string) {
+func (room *ChatRoom) RemovePeer(uuid string) {
     room.mu.Lock()
     defer room.mu.Unlock()
 
     for i, p := range room.Peers {
         if p.uuid == uuid {
-            fmt.Println(util.Info, "Removing peer:", p.Name, "with UUID:", p.uuid)
             room.Peers = append(room.Peers[:i], room.Peers[i+1:]...)
             return
         }
@@ -195,13 +239,10 @@ func (cr *ChatRoom) Shutdown() {
     cr.mu.Lock()
     defer cr.mu.Unlock()
     
-    fmt.Println(util.Info, "Shutting down chat room, closing", len(cr.Peers), "connections")
     
-    // Close all peer connections
     for _, peer := range cr.Peers {
         peer.Conn.Close()
     }
     
-    // Clear the peers slice
     cr.Peers = cr.Peers[:0]
 }

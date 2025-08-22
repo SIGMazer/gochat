@@ -1,12 +1,12 @@
 package netx
 
 import (
-    "context"
-    "fmt"
-    "net"
-    "sync"
-    "gochat/internal/util"
-    "gochat/internal/chat"
+	"context"
+	"fmt"
+	"gochat/internal/chat"
+	"gochat/internal/util"
+	"net"
+	"sync"
 )
 
 
@@ -17,7 +17,6 @@ func Listen(port int) (net.Listener, error) {
         fmt.Println(util.Error, "Failed to listen on port", port, ":", error)
         return nil, error
     }
-    fmt.Println(util.Info, "Listening on port", port)
     return ln, nil
 }
 
@@ -37,7 +36,6 @@ func AcceptConnections(ctx context.Context, ln net.Listener, name string, wg *sy
     for {
         select {
         case <-done:
-            fmt.Println(util.Info, "AcceptConnections shutting down...")
             return
         default:
             conn, err := ln.Accept()
@@ -45,7 +43,6 @@ func AcceptConnections(ctx context.Context, ln net.Listener, name string, wg *sy
                 fmt.Println(util.Error, "Failed to accept connection:", err)
                 continue
             }
-            fmt.Println(util.Info, "Accepted connection from", conn.RemoteAddr())
             
             connCtx, connCancel := context.WithCancel(ctx)
             
